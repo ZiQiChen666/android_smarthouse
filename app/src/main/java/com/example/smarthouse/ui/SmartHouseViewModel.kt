@@ -15,9 +15,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 
 /** 单条采样点，用于绘制曲线 */
 data class Sample(
@@ -29,7 +27,6 @@ data class UiState(
     val selectedDevice: DeviceConfig = ThingModel.devices.first(),
     val values: Map<String, String> = emptyMap(),
     val isLoading: Boolean = false,
-    val isSending: Boolean = false,
     val connectionState: ConnectionState = ConnectionState.Idle,
     val message: String? = null,
     val lastUpdated: Long? = null,
@@ -56,17 +53,10 @@ class SmartHouseViewModel(
      */
     private val pollLock = Mutex()
 
-    /** 下发锁：只用于下发请求之间互斥，防止用户连点导致并发下发 */
-    private val sendLock = Mutex()
-
     private var pollJob: Job? = null
 
     /** 轮询连续失败次数，用于区分"偶发失败"和"真正掉线" */
     private var pollFailStreak = 0
-
-    /** 下发期间暂停轮询，保证下发能立即占用连接 */
-    @Volatile
-    private var pollingPaused = false
 
     companion object {
         /** 轮询间隔：1 秒 */
@@ -75,8 +65,6 @@ class SmartHouseViewModel(
         private const val MAX_SAMPLES = 60
         /** 连续失败多少次才判定为"连接异常" */
         private const val OFFLINE_THRESHOLD = 3
-        /** 下发硬超时：超过此时间立即恢复按钮，避免长时间卡在"下发中" */
-        private const val SEND_TIMEOUT_MS = 8_000L
     }
 
     init {
@@ -102,9 +90,7 @@ class SmartHouseViewModel(
         pollJob?.cancel()
         pollJob = viewModelScope.launch {
             while (true) {
-                if (!pollingPaused) {
-                    refresh()
-                }
+                refresh()
                 delay(POLL_INTERVAL_MS)
             }
         }
@@ -113,8 +99,6 @@ class SmartHouseViewModel(
     /** 查询全部属性 (GET)。非阻塞拿锁，避免与下发互相等待 */
     private suspend fun refresh() {
         val device = _state.value.selectedDevice
-        // 下发期间直接跳过，不参与竞争
-        if (pollingPaused) return
         // 已有轮询在途则跳过本轮，不排队等待
         if (!pollLock.tryLock()) return
         try {
@@ -230,40 +214,14 @@ class SmartHouseViewModel(
 
     private fun sendParams(params: Map<String, Any>) {
         val device = _state.value.selectedDevice
-        // 防止用户连点导致并发下发
-        if (_state.value.isSending) return
-        _state.update { it.copy(isSending = true) }
-        // 下发期间暂停轮询，保证下发能立即占用连接
-        pollingPaused = true
+        // 直接下发，不等待、不阻塞界面
         viewModelScope.launch {
             try {
-                sendLock.withLock {
-                    withTimeout(SEND_TIMEOUT_MS) {
-                        withContext(Dispatchers.IO) {
-                            client.setProperties(ThingModel.PRODUCT_ID, device.deviceId, device.deviceKey, params)
-                        }
-                    }
+                withContext(Dispatchers.IO) {
+                    client.setProperties(ThingModel.PRODUCT_ID, device.deviceId, device.deviceKey, params)
                 }
-                _state.update {
-                    it.copy(
-                        isSending = false,
-                        message = "下发成功",
-                        connectionState = ConnectionState.Online
-                    )
-                }
-                // 下发成功后重置失败计数，避免残留计数把状态压成 Error
-                pollFailStreak = 0
-            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-                _state.update {
-                    it.copy(isSending = false, message = "下发超时，请稍后重试")
-                }
-            } catch (e: Exception) {
-                _state.update {
-                    it.copy(isSending = false, message = "下发失败：${e.message ?: "未知错误"}")
-                }
-            } finally {
-                // 无论成功失败都恢复轮询
-                pollingPaused = false
+            } catch (_: Exception) {
+                // 只负责下发，不处理结果状态
             }
         }
     }

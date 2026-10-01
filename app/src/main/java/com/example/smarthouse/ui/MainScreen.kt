@@ -222,7 +222,7 @@ fun MainScreen(viewModel: SmartHouseViewModel = viewModel()) {
                             checked = checked,
                             icon = switchIcon(prop.identifier),
                             accent = switchColor(prop.identifier),
-                            enabled = !state.isSending,
+                            enabled = true,
                             onCheckedChange = { viewModel.sendSwitch(prop.identifier, it) }
                         )
                     }
@@ -236,7 +236,7 @@ fun MainScreen(viewModel: SmartHouseViewModel = viewModel()) {
                     ThresholdRow(
                         label = prop.name,
                         unit = prop.unit,
-                        enabled = !state.isSending,
+                        enabled = true,
                         onSend = { viewModel.sendProperty(prop.identifier, it) }
                     )
                 }
