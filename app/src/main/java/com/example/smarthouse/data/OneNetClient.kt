@@ -25,13 +25,23 @@ import javax.crypto.spec.SecretKeySpec
  */
 class OneNetClient {
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
-        .writeTimeout(12, TimeUnit.SECONDS)
-        .callTimeout(15, TimeUnit.SECONDS)
+    // 轮询用：能容忍稍长的响应
+    private val pollClient = OkHttpClient.Builder()
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS)
+        .writeTimeout(6, TimeUnit.SECONDS)
+        .callTimeout(8, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
-        // 复用长连接，减少 1s 轮询下的 TLS 握手与端口占用
+        .connectionPool(okhttp3.ConnectionPool(8, 5, TimeUnit.MINUTES))
+        .build()
+
+    // 下发用：要求快速返回，避免按钮长时间处于“下发中”
+    private val sendClient = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .callTimeout(6, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .connectionPool(okhttp3.ConnectionPool(8, 5, TimeUnit.MINUTES))
         .build()
 
@@ -39,8 +49,11 @@ class OneNetClient {
         private const val HOST = "https://iot-api.heclouds.com"
         private const val TOKEN_VERSION = "2018-10-31"
         private const val DEFAULT_EXPIRE = 3600L * 24 * 30 // 30 天
-        private const val MAX_RETRY = 3
-        private const val RETRY_DELAY_MS = 250L
+        /** 轮询重试：尽量拉回一次结果，但总时长仍可接受 */
+        private const val POLL_MAX_RETRY = 2
+        /** 下发重试：重试次数少、退避短，保证快速给出结果 */
+        private const val SEND_MAX_RETRY = 2
+        private const val RETRY_DELAY_MS = 150L
     }
 
     // ------------------------------------------------------------------
@@ -99,7 +112,7 @@ class OneNetClient {
             .get()
             .build()
 
-        return executeWithRetry(request) { body -> parsePropertyData(body) }
+        return executeWithRetry(POLL_MAX_RETRY, pollClient, request) { body -> parsePropertyData(body) }
     }
 
     /**
@@ -158,7 +171,8 @@ class OneNetClient {
             .post(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        return executeWithRetry(request) { body ->
+        // 注：请求失败时抛出异常，超时由 OkHttp 的 callTimeout 控制
+        return executeWithRetry(SEND_MAX_RETRY, sendClient, request) { body ->
             val root = JSONObject(body)
             val code = root.optInt("code", -1)
             if (code != 0) {
@@ -172,11 +186,16 @@ class OneNetClient {
     // 带回退重试的请求执行
     // ------------------------------------------------------------------
 
-    private fun <T> executeWithRetry(request: Request, parse: (String) -> T): T {
+    private fun <T> executeWithRetry(
+        maxRetry: Int,
+        httpClient: OkHttpClient,
+        request: Request,
+        parse: (String) -> T
+    ): T {
         var lastError: Exception? = null
-        for (attempt in 1..MAX_RETRY) {
+        for (attempt in 1..maxRetry) {
             try {
-                client.newCall(request).execute().use { response ->
+                httpClient.newCall(request).execute().use { response ->
                     val body = response.body?.string().orEmpty()
 
                     // 5xx / 429 属于临时性错误，重试
@@ -200,7 +219,7 @@ class OneNetClient {
                 lastError = e
             }
 
-            if (attempt < MAX_RETRY) {
+            if (attempt < maxRetry) {
                 try {
                     Thread.sleep(RETRY_DELAY_MS * attempt)
                 } catch (_: InterruptedException) {

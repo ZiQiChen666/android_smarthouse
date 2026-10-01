@@ -17,6 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 /** 单条采样点，用于绘制曲线 */
 data class Sample(
@@ -50,10 +51,13 @@ class SmartHouseViewModel(
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     /**
-     * 串行化所有云端请求，避免 1s 轮询与下发指令互相抢占连接。
-     * 注意：只保护真正的网络调用，不保护状态更新，避免轮询结果被下发结果覆盖。
+     * 轮询锁：只用于轮询请求之间互斥。用 tryLock 非阻塞获取，
+     * 拿不到就跳过本轮，绝不阻塞其他操作。
      */
-    private val requestLock = Mutex()
+    private val pollLock = Mutex()
+
+    /** 下发锁：只用于下发请求之间互斥，防止用户连点导致并发下发 */
+    private val sendLock = Mutex()
 
     private var pollJob: Job? = null
 
@@ -71,6 +75,8 @@ class SmartHouseViewModel(
         private const val MAX_SAMPLES = 60
         /** 连续失败多少次才判定为"连接异常" */
         private const val OFFLINE_THRESHOLD = 3
+        /** 下发硬超时：超过此时间立即恢复按钮，避免长时间卡在"下发中" */
+        private const val SEND_TIMEOUT_MS = 8_000L
     }
 
     init {
@@ -104,14 +110,16 @@ class SmartHouseViewModel(
         }
     }
 
-    /** 查询全部属性 (GET) */
+    /** 查询全部属性 (GET)。非阻塞拿锁，避免与下发互相等待 */
     private suspend fun refresh() {
         val device = _state.value.selectedDevice
+        // 下发期间直接跳过，不参与竞争
+        if (pollingPaused) return
+        // 已有轮询在途则跳过本轮，不排队等待
+        if (!pollLock.tryLock()) return
         try {
             val result = withContext(Dispatchers.IO) {
-                requestLock.withLock {
-                    client.queryProperties(ThingModel.PRODUCT_ID, device.deviceId, device.deviceKey)
-                }
+                client.queryProperties(ThingModel.PRODUCT_ID, device.deviceId, device.deviceKey)
             }
             // 设备可能在请求期间被切换，丢弃过期结果
             if (device.deviceId != _state.value.selectedDevice.deviceId) return
@@ -151,6 +159,8 @@ class SmartHouseViewModel(
                     it.copy(isLoading = false, connectionState = ConnectionState.Error)
                 }
             }
+        } finally {
+            pollLock.unlock()
         }
     }
 
@@ -175,17 +185,18 @@ class SmartHouseViewModel(
     fun fetchTargetIp() {
         val device = ThingModel.devices.firstOrNull { ThingModel.hasTargetIp(it.deviceId) } ?: return
         viewModelScope.launch {
+            if (!pollLock.tryLock()) return@launch
             try {
                 val result = withContext(Dispatchers.IO) {
-                    requestLock.withLock {
-                        client.queryProperties(ThingModel.PRODUCT_ID, device.deviceId, device.deviceKey)
-                    }
+                    client.queryProperties(ThingModel.PRODUCT_ID, device.deviceId, device.deviceKey)
                 }
                 result[ThingModel.TARGET_IP]?.takeIf { it.isNotBlank() }?.let { ip ->
                     _state.update { it.copy(targetIp = ip) }
                 }
             } catch (_: Exception) {
                 // 静默失败，不影响主流程
+            } finally {
+                pollLock.unlock()
             }
         }
     }
@@ -219,14 +230,18 @@ class SmartHouseViewModel(
 
     private fun sendParams(params: Map<String, Any>) {
         val device = _state.value.selectedDevice
+        // 防止用户连点导致并发下发
+        if (_state.value.isSending) return
         _state.update { it.copy(isSending = true) }
-        // 下发期间暂停轮询，避免轮询占着 Mutex 导致下发排队甚至超时
+        // 下发期间暂停轮询，保证下发能立即占用连接
         pollingPaused = true
         viewModelScope.launch {
             try {
-                withContext(Dispatchers.IO) {
-                    requestLock.withLock {
-                        client.setProperties(ThingModel.PRODUCT_ID, device.deviceId, device.deviceKey, params)
+                sendLock.withLock {
+                    withTimeout(SEND_TIMEOUT_MS) {
+                        withContext(Dispatchers.IO) {
+                            client.setProperties(ThingModel.PRODUCT_ID, device.deviceId, device.deviceKey, params)
+                        }
                     }
                 }
                 _state.update {
@@ -238,6 +253,10 @@ class SmartHouseViewModel(
                 }
                 // 下发成功后重置失败计数，避免残留计数把状态压成 Error
                 pollFailStreak = 0
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                _state.update {
+                    it.copy(isSending = false, message = "下发超时，请稍后重试")
+                }
             } catch (e: Exception) {
                 _state.update {
                     it.copy(isSending = false, message = "下发失败：${e.message ?: "未知错误"}")
